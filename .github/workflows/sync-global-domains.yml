@@ -11,9 +11,10 @@ on:
         default: "main"
         type: string
 
+# fork 仓库里 GITHUB_TOKEN 无法创建 PR（repo 设置限制），
+# 因此改为直接 push 到 main —— 本仓库 main 无分支保护，contents: write 已实测可用。
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync-global-domains:
@@ -40,21 +41,14 @@ jobs:
       - name: Verify custom domains were not touched
         run: git diff --exit-code -- src/static/global_domains.custom.json
 
-      - name: Create pull request
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
-        with:
-          branch: chore/sync-bitwarden-global-domains
-          delete-branch: true
-          title: "chore: sync Bitwarden global domain rules"
-          commit-message: "chore: sync Bitwarden global domain rules"
-          body: |
-            Automated sync from bitwarden/server.
-
-            This PR only updates:
-            - `src/static/global_domains.bitwarden.json`
-            - `src/static/global_domains.bitwarden.meta.json`
-
-            `src/static/global_domains.custom.json` is intentionally left untouched.
-          add-paths: |
-            src/static/global_domains.bitwarden.json
-            src/static/global_domains.bitwarden.meta.json
+      - name: Commit and push synced rules to main
+        run: |
+          if git diff --quiet -- src/static/global_domains.bitwarden.json src/static/global_domains.bitwarden.meta.json; then
+            echo "Nothing to sync — upstream rules unchanged."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/static/global_domains.bitwarden.json src/static/global_domains.bitwarden.meta.json
+          git commit -m "chore: sync Bitwarden global domain rules"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
