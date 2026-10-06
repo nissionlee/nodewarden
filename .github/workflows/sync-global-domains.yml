@@ -5,16 +5,24 @@ on:
     - cron: "17 4 * * 1"
   workflow_dispatch:
     inputs:
-      bitwarden_ref:
-        description: "bitwarden/server ref to sync"
+      upstream_ref:
+        description: "shuaiplus/nodewarden ref to mirror"
         required: false
         default: "main"
         type: string
 
-# fork 仓库里 GITHUB_TOKEN 无法创建 PR（repo 设置限制），
-# 因此改为直接 push 到 main —— 本仓库 main 无分支保护，contents: write 已实测可用。
+# fork 专用说明，改这个文件前先读：
+#   1. 本仓库是 shuaiplus/nodewarden 的 fork，GITHUB_TOKEN 在 fork 里无权创建 PR，
+#      所以同步结果直接提交到 main，不走 PR。
+#   2. 数据源不是上游 bitwarden/server 的 C# 源码，而是**直接镜像上游仓库里已经
+#      生成并提交好的那两个 json**。这样 fork 的文件与上游逐字节一致，
+#      generatedAt 这类时间戳不会再造成 fork/上游之间的合并冲突。
+#   3. 本文件是 fork 相对上游唯一的差异文件，请尽量别引入新的差异。
 permissions:
   contents: write
+
+env:
+  UPSTREAM_REPO: shuaiplus/nodewarden
 
 jobs:
   sync-global-domains:
@@ -26,29 +34,73 @@ jobs:
         with:
           node-version: 22
 
-      - name: Sync generated Bitwarden domains
+      - name: Mirror upstream generated domain rules
         env:
-          BITWARDEN_REF: ${{ inputs.bitwarden_ref || 'main' }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
         run: |
-          case "$BITWARDEN_REF" in
+          set -euo pipefail
+          case "$UPSTREAM_REF" in
             "" | *[!A-Za-z0-9._/-]* )
-              echo "Invalid bitwarden_ref"
+              echo "Invalid upstream_ref"
               exit 1
               ;;
           esac
-          npm run domains:sync -- --ref "$BITWARDEN_REF"
+
+          base="https://raw.githubusercontent.com/${UPSTREAM_REPO}/${UPSTREAM_REF}/src/static"
+          rules="global_domains.bitwarden.json"
+          meta="global_domains.bitwarden.meta.json"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          # 先落到临时目录，校验通过再覆盖 —— 抓取或校验失败时绝不写坏仓库里的文件
+          for f in "$rules" "$meta"; do
+            curl -fsSL --retry 3 --retry-delay 2 --max-time 60 "$base/$f" -o "$tmp/$f"
+          done
+
+          RULES="$tmp/$rules" META="$tmp/$meta" node -e '
+            const fs = require("node:fs");
+            const rules = JSON.parse(fs.readFileSync(process.env.RULES, "utf8"));
+            const meta = JSON.parse(fs.readFileSync(process.env.META, "utf8"));
+
+            if (!Array.isArray(rules) || rules.length === 0) {
+              throw new Error("rules file is not a non-empty array");
+            }
+            rules.forEach((rule, i) => {
+              if (!Number.isInteger(rule.type) || typeof rule.excluded !== "boolean" || !Array.isArray(rule.domains)) {
+                throw new Error(`rule #${i} has an unexpected shape`);
+              }
+              if (rule.domains.length < 2 || rule.domains.some((d) => typeof d !== "string" || !d)) {
+                throw new Error(`rule #${i} has a bad domain list`);
+              }
+            });
+            const domainsCount = rules.reduce((n, rule) => n + rule.domains.length, 0);
+            if (meta.rulesCount !== rules.length || meta.domainsCount !== domainsCount) {
+              throw new Error(
+                `meta counts disagree: meta says ${meta.rulesCount}/${meta.domainsCount}, file has ${rules.length}/${domainsCount}`
+              );
+            }
+            if (typeof meta.source !== "string" || !meta.source.includes("bitwarden/server")) {
+              throw new Error(`unexpected meta.source: ${meta.source}`);
+            }
+            console.log(`validated ${rules.length} rules / ${domainsCount} domains`);
+          '
+
+          cp "$tmp/$rules" "src/static/$rules"
+          cp "$tmp/$meta" "src/static/$meta"
 
       - name: Verify custom domains were not touched
         run: git diff --exit-code -- src/static/global_domains.custom.json
 
-      - name: Commit and push synced rules to main
+      - name: Commit and push mirrored rules to main
         run: |
+          set -euo pipefail
           if git diff --quiet -- src/static/global_domains.bitwarden.json src/static/global_domains.bitwarden.meta.json; then
-            echo "Nothing to sync — upstream rules unchanged."
+            echo "Nothing to sync — already identical to upstream."
             exit 0
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/static/global_domains.bitwarden.json src/static/global_domains.bitwarden.meta.json
+          git diff --cached --stat
           git commit -m "chore: sync Bitwarden global domain rules"
           git push origin "HEAD:${GITHUB_REF_NAME}"
