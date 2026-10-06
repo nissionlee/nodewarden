@@ -18,6 +18,9 @@ on:
 #      生成并提交好的那两个 json**。这样 fork 的文件与上游逐字节一致，
 #      generatedAt 这类时间戳不会再造成 fork/上游之间的合并冲突。
 #   3. 本文件是 fork 相对上游唯一的差异文件，请尽量别引入新的差异。
+#   4. 仓库里跑着 actionlint（见 .github/workflows/security-extra.yml），内联脚本会被
+#      shellcheck 检查。**别在单引号里出现 $**（SC2016 会让检查变红），
+#      JS 一律用 quoted heredoc 落成文件再执行，别用 node -e '...'。
 permissions:
   contents: write
 
@@ -50,40 +53,47 @@ jobs:
           rules="global_domains.bitwarden.json"
           meta="global_domains.bitwarden.meta.json"
           tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
+          cleanup() { rm -rf "$tmp"; }
+          trap cleanup EXIT
+
+          cat > "$tmp/validate.mjs" <<'JS'
+          import { readFileSync } from "node:fs";
+
+          const rules = JSON.parse(readFileSync(process.env.RULES, "utf8"));
+          const meta = JSON.parse(readFileSync(process.env.META, "utf8"));
+
+          if (!Array.isArray(rules) || rules.length === 0) {
+            throw new Error("rules file is not a non-empty array");
+          }
+          rules.forEach((rule, i) => {
+            if (!Number.isInteger(rule.type) || typeof rule.excluded !== "boolean" || !Array.isArray(rule.domains)) {
+              throw new Error("rule #" + i + " has an unexpected shape");
+            }
+            if (rule.domains.length < 2 || rule.domains.some((d) => typeof d !== "string" || !d)) {
+              throw new Error("rule #" + i + " has a bad domain list");
+            }
+          });
+
+          const domainsCount = rules.reduce((n, rule) => n + rule.domains.length, 0);
+          if (meta.rulesCount !== rules.length || meta.domainsCount !== domainsCount) {
+            throw new Error(
+              "meta counts disagree: meta says " + meta.rulesCount + "/" + meta.domainsCount +
+                ", file has " + rules.length + "/" + domainsCount
+            );
+          }
+          if (typeof meta.source !== "string" || !meta.source.includes("bitwarden/server")) {
+            throw new Error("unexpected meta.source: " + meta.source);
+          }
+
+          console.log("validated " + rules.length + " rules / " + domainsCount + " domains");
+          JS
 
           # 先落到临时目录，校验通过再覆盖 —— 抓取或校验失败时绝不写坏仓库里的文件
           for f in "$rules" "$meta"; do
             curl -fsSL --retry 3 --retry-delay 2 --max-time 60 "$base/$f" -o "$tmp/$f"
           done
 
-          RULES="$tmp/$rules" META="$tmp/$meta" node -e '
-            const fs = require("node:fs");
-            const rules = JSON.parse(fs.readFileSync(process.env.RULES, "utf8"));
-            const meta = JSON.parse(fs.readFileSync(process.env.META, "utf8"));
-
-            if (!Array.isArray(rules) || rules.length === 0) {
-              throw new Error("rules file is not a non-empty array");
-            }
-            rules.forEach((rule, i) => {
-              if (!Number.isInteger(rule.type) || typeof rule.excluded !== "boolean" || !Array.isArray(rule.domains)) {
-                throw new Error(`rule #${i} has an unexpected shape`);
-              }
-              if (rule.domains.length < 2 || rule.domains.some((d) => typeof d !== "string" || !d)) {
-                throw new Error(`rule #${i} has a bad domain list`);
-              }
-            });
-            const domainsCount = rules.reduce((n, rule) => n + rule.domains.length, 0);
-            if (meta.rulesCount !== rules.length || meta.domainsCount !== domainsCount) {
-              throw new Error(
-                `meta counts disagree: meta says ${meta.rulesCount}/${meta.domainsCount}, file has ${rules.length}/${domainsCount}`
-              );
-            }
-            if (typeof meta.source !== "string" || !meta.source.includes("bitwarden/server")) {
-              throw new Error(`unexpected meta.source: ${meta.source}`);
-            }
-            console.log(`validated ${rules.length} rules / ${domainsCount} domains`);
-          '
+          RULES="$tmp/$rules" META="$tmp/$meta" node "$tmp/validate.mjs"
 
           cp "$tmp/$rules" "src/static/$rules"
           cp "$tmp/$meta" "src/static/$meta"
